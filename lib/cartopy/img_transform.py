@@ -27,6 +27,7 @@ import scipy.spatial
 
 import cartopy.crs as ccrs
 
+import time
 
 def mesh_projection(projection, nx, ny,
                     x_extents=[None, None],
@@ -235,7 +236,7 @@ def _determine_bounds(x_coords, y_coords, source_cs):
 
 
 def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
-           target_x_points, target_y_points, mask_extrapolated=False):
+           target_x_points, target_y_points, mask_extrapolated=False, ndict = {}):
     """
     Regrid the data array from the source projection to the target projection.
 
@@ -277,7 +278,7 @@ def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
         The data array regridded in the target projection.
 
     """
-
+    t0 = time.time()
     # n.b. source_cs is actually a projection (the coord system of the
     # source coordinates), but not necessarily the native projection of
     # the source array (i.e. you can provide a warped image with lat lon
@@ -285,23 +286,38 @@ def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
 
     # XXX NB. target_x and target_y must currently be rectangular (i.e.
     # be a 2d np array)
-    geo_cent = source_cs.as_geocentric()
-    xyz = geo_cent.transform_points(source_cs,
-                                    source_x_coords.flatten(),
-                                    source_y_coords.flatten())
-    target_xyz = geo_cent.transform_points(target_proj,
-                                           target_x_points.flatten(),
-                                           target_y_points.flatten())
-
+    if not "kdtree" in ndict:
+        geo_cent = source_cs.as_geocentric()
+        xyz = geo_cent.transform_points(source_cs,
+                                        source_x_coords.flatten(),
+                                        source_y_coords.flatten())
+        target_xyz = geo_cent.transform_points(target_proj,
+                                               target_x_points.flatten(),
+                                               target_y_points.flatten())
+    
     # Versions of scipy >= v0.16 added the balanced_tree argument,
     # which caused the KDTree to hang with this input.
-    try:
-        kdtree = scipy.spatial.cKDTree(xyz, balanced_tree=False)
-    except TypeError:
-        kdtree = scipy.spatial.cKDTree(xyz)
+    t1 = time.time()
 
-    distances, indices = kdtree.query(target_xyz, k=1)
+    if not "kdtree" in ndict:
+        print("computing new kdtree")
+        try:
+            kdtree = scipy.spatial.cKDTree(xyz, balanced_tree=False)
+        except TypeError:
+            kdtree = scipy.spatial.cKDTree(xyz)
+        distances, indices = kdtree.query(target_xyz, k=1)
+
+    else:
+        kdtree = ndict["kdtree"]
+        distances = ndict["distances"]
+        indices = ndict["indices"]
+    t2 = time.time()
+
+##        distances, indices = kdtree.query(target_xyz, k=1)
     mask = np.isinf(distances)
+
+    t3 = time.time()
+
 
     desired_ny, desired_nx = target_x_points.shape
     if array.ndim == 1:
@@ -334,28 +350,48 @@ def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
     else:
         raise ValueError(
             'Expected array.ndim to be 1, 2 or 3, got {}'.format(array.ndim))
+    
+    t4 = time.time()
+
 
     # Do double transform to clip points that do not map back and forth
     # to the same point to within a fixed fractional offset.
     # XXX THIS ONLY NEEDS TO BE DONE FOR (PSEUDO-)CYLINDRICAL PROJECTIONS
     # (OR ANY OTHERS WHICH HAVE THE CONCEPT OF WRAPPING)
-    source_desired_xyz = source_cs.transform_points(target_proj,
-                                                    target_x_points.flatten(),
-                                                    target_y_points.flatten())
-    back_to_target_xyz = target_proj.transform_points(source_cs,
-                                                      source_desired_xyz[:, 0],
-                                                      source_desired_xyz[:, 1])
-    back_to_target_x = back_to_target_xyz[:, 0].reshape(desired_ny,
-                                                        desired_nx)
-    back_to_target_y = back_to_target_xyz[:, 1].reshape(desired_ny,
-                                                        desired_nx)
+    if not "back_to_target_x" in ndict:
+        source_desired_xyz = source_cs.transform_points(target_proj,
+                                                        target_x_points.flatten(),
+                                                        target_y_points.flatten())
+        t41 = time.time()
+        back_to_target_xyz = target_proj.transform_points(source_cs,
+                                                          source_desired_xyz[:, 0],
+                                                          source_desired_xyz[:, 1])
+        t42 = time.time()
+        back_to_target_x = back_to_target_xyz[:, 0].reshape(desired_ny,
+                                                            desired_nx)
+
+        t43 = time.time()
+        back_to_target_y = back_to_target_xyz[:, 1].reshape(desired_ny,
+                                                            desired_nx)
+    else:
+        back_to_target_x = ndict["back_to_target_x"]
+        back_to_target_y = ndict["back_to_target_y"]
+        t41 = time.time()
+        t42 = time.time()
+        t43 = time.time()
+
+
+    t44 = time.time()
     FRACTIONAL_OFFSET_THRESHOLD = 0.1  # data has moved by 10% of the map
+    t45 = time.time()
 
     x_extent = np.abs(target_proj.x_limits[1] - target_proj.x_limits[0])
     y_extent = np.abs(target_proj.y_limits[1] - target_proj.y_limits[0])
+    t46 = time.time()
 
     non_self_inverse_points = (np.abs(target_x_points - back_to_target_x) /
                                x_extent) > FRACTIONAL_OFFSET_THRESHOLD
+    t5=time.time()
     if np.any(non_self_inverse_points):
         if np.ma.isMaskedArray(new_array):
             new_array[non_self_inverse_points] = np.ma.masked
@@ -366,32 +402,36 @@ def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
                     new_array[non_self_inverse_points, i] = np.ma.masked
             else:
                 new_array[non_self_inverse_points] = np.ma.masked
-    non_self_inverse_points = (np.abs(target_y_points - back_to_target_y) /
+    non_self_inverse_points2 = (np.abs(target_y_points - back_to_target_y) /
                                y_extent) > FRACTIONAL_OFFSET_THRESHOLD
-    if np.any(non_self_inverse_points):
+    if np.any(non_self_inverse_points2):
         if np.ma.isMaskedArray(new_array):
-            new_array[non_self_inverse_points] = np.ma.masked
+            new_array[non_self_inverse_points2] = np.ma.masked
         else:
-            new_array = np.ma.array(new_array, mask=non_self_inverse_points)
+            new_array = np.ma.array(new_array, mask=non_self_inverse_points2)
 
+    t6 = time.time()
     # Transform the target points to the source projection and mask any points
     # that fall outside the original source domain.
     if mask_extrapolated:
-        target_in_source_xyz = source_cs.transform_points(
-            target_proj, target_x_points, target_y_points)
-        target_in_source_x = target_in_source_xyz[..., 0]
-        target_in_source_y = target_in_source_xyz[..., 1]
-
-        bounds = _determine_bounds(source_x_coords, source_y_coords, source_cs)
-
-        outside_source_domain = ((target_in_source_y >= bounds['y'][1]) |
-                                 (target_in_source_y <= bounds['y'][0]))
-
-        tmp_inside = np.zeros_like(outside_source_domain)
-        for bound_x in bounds['x']:
-            tmp_inside = tmp_inside | ((target_in_source_x <= bound_x[1]) &
-                                       (target_in_source_x >= bound_x[0]))
-        outside_source_domain = outside_source_domain | ~tmp_inside
+        if not "outside_source_domain" in ndict:
+            target_in_source_xyz = source_cs.transform_points(
+                target_proj, target_x_points, target_y_points)
+            target_in_source_x = target_in_source_xyz[..., 0]
+            target_in_source_y = target_in_source_xyz[..., 1]
+    
+            bounds = _determine_bounds(source_x_coords, source_y_coords, source_cs)
+    
+            outside_source_domain = ((target_in_source_y >= bounds['y'][1]) |
+                                     (target_in_source_y <= bounds['y'][0]))
+    
+            tmp_inside = np.zeros_like(outside_source_domain)
+            for bound_x in bounds['x']:
+                tmp_inside = tmp_inside | ((target_in_source_x <= bound_x[1]) &
+                                           (target_in_source_x >= bound_x[0]))
+            outside_source_domain = outside_source_domain | ~tmp_inside
+        else:
+            outside_source_domain = ndict["outside_source_domain"]
 
         if np.ma.isMaskedArray(new_array):
             if np.any(outside_source_domain):
@@ -403,4 +443,9 @@ def regrid(array, source_x_coords, source_y_coords, source_cs, target_proj,
                     new_array[outside_source_domain, i] = np.ma.masked
             else:
                 new_array[outside_source_domain] = np.ma.masked
-    return new_array
+    t7=time.time()
+    #print(t7-t0)
+    #print(t7-t6,t6-t5,t5-t4,t4-t3,t3-t2,t2-t1,t1-t0)
+    #print(t5-t46,t46-t45,t45-t44,t44-t43,t43-t42,t42-t41,t41-t4)
+    ndict = {"kdtree":kdtree, "distances":distances, "indices":indices, "non_self_inverse_points":non_self_inverse_points, "non_self_inverse_points2":non_self_inverse_points2, "back_to_target_x":back_to_target_x, "back_to_target_y":back_to_target_y, "outside_source_domain":outside_source_domain}
+    return new_array, ndict

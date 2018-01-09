@@ -24,6 +24,7 @@ The CRS class is the base-class for all projections defined in :mod:`cartopy.crs
 from collections import OrderedDict
 import re
 import warnings
+import time
 
 import numpy as np
 import six
@@ -363,7 +364,7 @@ cdef class CRS:
 
         return result
 
-    def transform_vectors(self, src_crs, x, y, u, v):
+    def transform_vectors(self, src_crs, x, y, u, v, ndict={}):
         """
         transform_vectors(src_crs, x, y, u, v)
 
@@ -398,26 +399,40 @@ cdef class CRS:
            good enough for visualization purposes.
 
         """
+
+        print("ADEBUUG transform_vectors")
+
+        t1 = time.time()
         if not (x.shape == y.shape == u.shape == v.shape):
             raise ValueError('x, y, u and v arrays must be the same shape')
         if x.ndim not in (1, 2):
             raise ValueError('x, y, u and v must be 1 or 2 dimensional')
         # Transform the coordinates to the target projection.
-        proj_xyz = self.transform_points(src_crs, x, y)
-        target_x, target_y = proj_xyz[..., 0], proj_xyz[..., 1]
+        if not "proj_xyz1" in ndict:
+            proj_xyz1 = self.transform_points(src_crs, x, y)
+        else:
+            proj_xyz1 = ndict["proj_xyz1"]
+        ## proj_xyz approx 0.7s
+        t2=time.time()
+        target_x, target_y = proj_xyz1[..., 0], proj_xyz1[..., 1]
+        t3=time.time()
         # Rotate the input vectors to the projection.
         #
         # 1: Find the magnitude and direction of the input vectors.
-        vector_magnitudes = (u**2 + v**2)**0.5
+        ## vector_magnitudes = (u**2 + v**2)**0.5
+        vector_magnitudes = np.sqrt(u**2 + v**2)
         vector_angles = np.arctan2(v, u)
+        t4=time.time()
         # 2: Find a point in the direction of the original vector that is
         #    a small distance away from the base point of the vector (near
         #    the poles the point may have to be in the opposite direction
         #    to be valid).
         factor = 360000.
         delta = (src_crs.x_limits[1] - src_crs.x_limits[0]) / factor
+        t45=time.time()
         x_perturbations = delta * np.cos(vector_angles)
         y_perturbations = delta * np.sin(vector_angles)
+        t5=time.time()
         # 3: Handle points that are invalid. These come from picking a new
         #    point that is outside the domain of the CRS. The first step is
         #    to apply the native transform to the input coordinates to make
@@ -426,8 +441,14 @@ cdef class CRS:
         #    valid x-domain and fix them. After that do the same for points
         #    that are outside the valid y-domain, which may reintroduce some
         #    points outside of the valid x-domain
-        proj_xyz = src_crs.transform_points(src_crs, x, y)
-        source_x, source_y = proj_xyz[..., 0], proj_xyz[..., 1]
+        if not "proj_xyz2" in ndict:
+            proj_xyz2 = src_crs.transform_points(src_crs, x, y)
+        else:
+            proj_xyz2 = ndict["proj_xyz2"]
+        t55 = time.time()
+        source_x, source_y = proj_xyz2[..., 0], proj_xyz2[..., 1]
+        
+        t6=time.time()
         #    Detect all the coordinates where the perturbation takes the point
         #    outside of the valid x-domain, and reverse the direction of the
         #    perturbation to fix this.
@@ -438,6 +459,7 @@ cdef class CRS:
         if invalid_x.any():
             x_perturbations[invalid_x] *= -1
             y_perturbations[invalid_x] *= -1
+        t7=time.time()
         #    Do the same for coordinates where the perturbation takes the point
         #    outside of the valid y-domain. This may reintroduce some points
         #    that will be outside the x-domain when the perturbation is
@@ -454,9 +476,11 @@ cdef class CRS:
         #    See if there were any points where we cannot reverse the direction
         #    of the perturbation to get the perturbed point within the valid
         #    domain of the projection, and issue a warning if there are.
+        t8=time.time()
         problem_points = np.logical_or(
             source_x + x_perturbations < src_crs.x_limits[0]-eps,
             source_x + x_perturbations > src_crs.x_limits[1]+eps)
+        t9=time.time()
         if problem_points.any():
             warnings.warn('Some vectors at source domain corners '
                           'may not have been transformed correctly')
@@ -464,20 +488,41 @@ cdef class CRS:
         #    find the angle between the base point and the perturbed point
         #    in the projection coordinates (reversing the direction at any
         #    points where the original was reversed in step 3).
-        proj_xyz = self.transform_points(src_crs,
+        if not "projected_angles" in ndict:
+            proj_xyz3 = self.transform_points(src_crs,
                                          source_x + x_perturbations,
                                          source_y + y_perturbations)
-        target_x_perturbed = proj_xyz[..., 0]
-        target_y_perturbed = proj_xyz[..., 1]
-        projected_angles = np.arctan2(target_y_perturbed - target_y,
+            target_x_perturbed = proj_xyz3[..., 0]
+            target_y_perturbed = proj_xyz3[..., 1]
+            projected_angles = np.arctan2(target_y_perturbed - target_y,
                                       target_x_perturbed - target_x)
+        else:
+            projected_angles = ndict["projected_angles"]
+
+        t10=time.time()
         if reversed_vectors.any():
             projected_angles[reversed_vectors] += np.pi
         # 5: Form the projected vector components, preserving the magnitude
         #    of the original vectors.
         projected_u = vector_magnitudes * np.cos(projected_angles)
         projected_v = vector_magnitudes * np.sin(projected_angles)
-        return projected_u, projected_v
+        t11=time.time()
+        ## print(t2-t1)
+        ## print(t3-t2)
+        ## print(t4-t3)
+        ## print(t45-t4)
+        ## print(t5-t45)
+        ## print(t55-t5)
+        ## print(t6-t55)
+        ## print(t6-t5)
+        ## print(t7-t6)
+        ## print(t8-t7)
+        ## print(t9-t8)
+
+        ## print(t10-t9)
+        ## print(t11-t10)
+        ## print("Tottime in _crx.pyx ", t11-t1)
+        return projected_u, projected_v, {"proj_xyz1":proj_xyz1,"proj_xyz2":proj_xyz2,"projected_angles":projected_angles}
 
 
 class Geodetic(CRS):
